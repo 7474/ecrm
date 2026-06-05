@@ -89,6 +89,15 @@ func (p *Planner) unusedImageIdentifiers(ctx context.Context, repo RepositoryNam
 		return nil, sums, err
 	}
 	log.Printf("[info] %s has %d images, %d image indexes, %d soci indexes", repo, len(images), len(imageIndexes), len(sociIndexes))
+
+	// Pre-compute which image indexes are kept (by all criteria) before evaluating individual images.
+	// This protects constituent platform-specific images (e.g. linux/amd64, linux/arm64) from being
+	// incorrectly marked as unused when they are only referenced indirectly via a kept Image Index.
+	keptIndexDigests, keptIndexIDs := p.computeKeptImageIndexIDs(rc, keepImages, imageIndexes)
+	if err := p.addConstituentImagesToKeep(ctx, repo, keptIndexIDs, keepImages); err != nil {
+		return nil, sums, fmt.Errorf("failed to protect constituent images of kept image indexes: %w", err)
+	}
+
 	expiredIds := make([]ecrTypes.ImageIdentifier, 0)
 	expiredImageIndexes := newSet()
 	var keepCount int64
@@ -146,18 +155,15 @@ IMAGE:
 		}
 	}
 
-IMAGE_INDEX:
 	for _, d := range imageIndexes {
 		log.Printf("[debug] is an image index %s", *d.ImageDigest)
 		sums.Add(d)
-		for _, tag := range d.ImageTags {
-			if expiredImageIndexes.contains(tag) {
-				log.Printf("[notice] %s:%s is expired (image index)", repo, tag)
-				sums.Expire(d)
-				expiredIds = append(expiredIds, ecrTypes.ImageIdentifier{ImageDigest: d.ImageDigest})
-				continue IMAGE_INDEX
-			}
+		if keptIndexDigests.contains(*d.ImageDigest) {
+			continue
 		}
+		log.Printf("[notice] image index %s@%s is expired %s", repo, *d.ImageDigest, d.ImagePushedAt.Format(time.RFC3339))
+		sums.Expire(d)
+		expiredIds = append(expiredIds, ecrTypes.ImageIdentifier{ImageDigest: d.ImageDigest})
 	}
 
 	sociIds, err := p.findSociIndex(ctx, repo, expiredImageIndexes.members())
@@ -218,6 +224,111 @@ func (p *Planner) listImageDetails(ctx context.Context, repo RepositoryName) ([]
 		return sociIndexes[i].ImagePushedAt.After(*sociIndexes[j].ImagePushedAt)
 	})
 	return images, imageIndexes, sociIndexes, foundTags, nil
+}
+
+// computeKeptImageIndexIDs determines which image indexes should be kept based on all standard
+// criteria (keepImages, tag matching, expiry, keepCount). Returns a set of kept digests and a
+// list of identifiers for use with BatchGetImage.
+func (p *Planner) computeKeptImageIndexIDs(rc *RepositoryConfig, keepImages Images, imageIndexes []ecrTypes.ImageDetail) (set, []ecrTypes.ImageIdentifier) {
+	keptDigests := newSet()
+	keptIDs := make([]ecrTypes.ImageIdentifier, 0)
+	var keepCount int64
+
+	for _, d := range imageIndexes {
+		keep := false
+		if isKeptImageIndex(d, p.region, keepImages) {
+			keep = true
+		} else {
+			tagMatched := false
+			for _, tag := range d.ImageTags {
+				if rc.MatchTag(tag) {
+					tagMatched = true
+					break
+				}
+			}
+			if tagMatched {
+				keep = true
+			} else if !rc.IsExpired(*d.ImagePushedAt) {
+				keep = true
+			} else {
+				_, tagged := imageTag(d)
+				if tagged {
+					keepCount++
+					if keepCount <= rc.KeepCount {
+						keep = true
+					}
+				}
+			}
+		}
+		if keep {
+			keptDigests.add(*d.ImageDigest)
+			keptIDs = append(keptIDs, ecrTypes.ImageIdentifier{ImageDigest: d.ImageDigest})
+		}
+	}
+	return keptDigests, keptIDs
+}
+
+// addConstituentImagesToKeep fetches manifests for the given Image Index identifiers and adds
+// every constituent (platform-specific) image digest to keepImages so they are not deleted.
+func (p *Planner) addConstituentImagesToKeep(ctx context.Context, repo RepositoryName, keptIndexIds []ecrTypes.ImageIdentifier, keepImages Images) error {
+	if len(keptIndexIds) == 0 {
+		return nil
+	}
+
+	// Batch-fetch manifests and register constituent image digests into keepImages.
+	for _, c := range lo.Chunk(keptIndexIds, batchGetImageLimit) {
+		res, err := p.ecr.BatchGetImage(ctx, &ecr.BatchGetImageInput{
+			ImageIds:       c,
+			RepositoryName: aws.String(string(repo)),
+			AcceptedMediaTypes: []string{
+				string(ociTypes.OCIManifestSchema1),
+				string(ociTypes.DockerManifestSchema1),
+				string(ociTypes.DockerManifestSchema2),
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to batch get image index manifest: %w", err)
+		}
+		for _, img := range res.Images {
+			if img.ImageManifest == nil {
+				continue
+			}
+			var m oci.IndexManifest
+			if err := json.Unmarshal([]byte(*img.ImageManifest), &m); err != nil {
+				log.Printf("[warn] failed to parse image index manifest: %s %s", *img.ImageManifest, err)
+				continue
+			}
+			for _, d := range m.Manifests {
+				// Skip Soci indexes; they are handled separately by findSociIndex.
+				if d.ArtifactType == MediaTypeSociIndex {
+					continue
+				}
+				constituentURI := ImageURI(fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com/%s@%s",
+					aws.ToString(img.RegistryId), p.region, aws.ToString(img.RepositoryName), d.Digest.String()))
+				if keepImages.Add(constituentURI, "image_index_constituent") {
+					log.Printf("[info] constituent image %s is added to keep list by parent image index", constituentURI)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// isKeptImageIndex reports whether an Image Index is referenced in keepImages (by digest or by tag).
+func isKeptImageIndex(d ecrTypes.ImageDetail, region string, keepImages Images) bool {
+	imageURISha256 := ImageURI(fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com/%s@%s",
+		aws.ToString(d.RegistryId), region, aws.ToString(d.RepositoryName), aws.ToString(d.ImageDigest)))
+	if keepImages.Contains(imageURISha256) {
+		return true
+	}
+	for _, tag := range d.ImageTags {
+		imageURI := ImageURI(fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com/%s:%s",
+			aws.ToString(d.RegistryId), region, aws.ToString(d.RepositoryName), tag))
+		if keepImages.Contains(imageURI) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Planner) findSociIndex(ctx context.Context, repo RepositoryName, imageTags []string) ([]ecrTypes.ImageIdentifier, error) {

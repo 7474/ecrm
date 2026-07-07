@@ -2,8 +2,10 @@ package ecrm
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
@@ -93,6 +95,10 @@ func (s *Scanner) collectImages(ctx context.Context, taskdefs []taskdef) error {
 
 		ids, err := s.extractECRImages(ctx, tds)
 		if err != nil {
+			if isTaskDefinitionUnavailableError(err) {
+				log.Printf("[warn] taskdef %s is unavailable (likely deleted). skipping", tds)
+				continue
+			}
 			return err
 		}
 		for _, id := range ids {
@@ -181,6 +187,7 @@ func (s *Scanner) collectTaskdefs(ctx context.Context, tcs []*TaskdefConfig) ([]
 			FamilyPrefix: &name,
 			MaxResults:   aws.Int32(int32(keepCount)),
 			Sort:         ecsTypes.SortOrderDesc,
+			Status:       ecsTypes.TaskDefinitionStatusActive,
 		})
 		if err != nil {
 			return tds, err
@@ -194,6 +201,15 @@ func (s *Scanner) collectTaskdefs(ctx context.Context, tcs []*TaskdefConfig) ([]
 		}
 	}
 	return tds, nil
+}
+
+func isTaskDefinitionUnavailableError(err error) bool {
+	var ce *ecsTypes.ClientException
+	if !errors.As(err, &ce) {
+		return false
+	}
+	msg := strings.ToLower(ce.ErrorMessage())
+	return strings.Contains(msg, "unable to describe task definition")
 }
 
 // availableResourcesInCluster scans task definitions and images in use in the cluster
